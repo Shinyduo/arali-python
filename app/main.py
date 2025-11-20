@@ -12,7 +12,7 @@ from uuid import UUID, uuid4
 import asyncpg
 import httpx
 import numpy as np
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sentence_transformers import SentenceTransformer
@@ -377,6 +377,7 @@ class FeatureReceptionPipeline:
         logger.info(f"Backfilled embeddings for {embedded} insights.")
         assigned, clusters_updated = await self._assign_clusters(batch_size)
         logger.info(f"Assigned {assigned} insights to clusters, updated {clusters_updated} clusters.")
+        logger.info("Daily batch processing complete.")
         return {"embedded": embedded, "assigned": assigned, "clusters_updated": clusters_updated}
 
     async def run_recluster(self, target_enterprise_id: UUID | None = None) -> list[dict]:
@@ -810,6 +811,7 @@ class DailyTaskRequest(BaseModel):
 
 
 class DailyTaskResponse(BaseModel):
+    message: str
     embedded: int
     assigned: int
     clusters_updated: int
@@ -857,10 +859,26 @@ def create_app() -> FastAPI:
     @app.post("/feature-reception/daily", response_model=DailyTaskResponse)
     async def trigger_daily(
         payload: DailyTaskRequest,
-        pipeline: FeatureReceptionPipeline = Depends(get_pipeline),
+        background_tasks: BackgroundTasks,
     ) -> DailyTaskResponse:
-        result = await pipeline.run_daily(payload.batch_size)
-        return DailyTaskResponse(**result)
+        async def _run_daily_task(batch_size: int) -> None:
+            if pool is None:
+                logger.error("DATABASE_URL not configured; cannot run daily task.")
+                return
+            async with pool.acquire() as connection:
+                pipeline = FeatureReceptionPipeline(connection)
+                try:
+                    await pipeline.run_daily(batch_size)
+                except Exception as exc:
+                    logger.exception("Daily task failed", exc_info=exc)
+
+        background_tasks.add_task(_run_daily_task, payload.batch_size)
+        return DailyTaskResponse(
+            message="Daily task scheduled. Check logs for progress.",
+            embedded=0,
+            assigned=0,
+            clusters_updated=0,
+        )
 
     @app.post("/feature-reception/weekly/recluster", response_model=list[ReclusterResponse])
     async def trigger_recluster(
