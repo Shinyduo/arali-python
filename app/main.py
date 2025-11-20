@@ -834,6 +834,7 @@ class ReclusterResponse(BaseModel):
 
 
 class LabelingResponse(BaseModel):
+    message: str | None = None
     labeled_clusters: int
 
 
@@ -900,12 +901,28 @@ def create_app() -> FastAPI:
 
     @app.post("/feature-reception/weekly/label", response_model=LabelingResponse)
     async def trigger_labeling(
+        background_tasks: BackgroundTasks,
         payload: WeeklyTaskRequest | None = None,
-        pipeline: FeatureReceptionPipeline = Depends(get_pipeline),
     ) -> LabelingResponse:
         enterprise_id = payload.enterprise_id if payload else None
-        count = await pipeline.run_labeling(enterprise_id)
-        return LabelingResponse(labeled_clusters=count)
+
+        async def _run_labeling_task(target_enterprise_id: UUID | None) -> None:
+            if pool is None:
+                logger.error("DATABASE_URL not configured; cannot run labeling task.")
+                return
+            async with pool.acquire() as connection:
+                pipeline = FeatureReceptionPipeline(connection)
+                try:
+                    labeled = await pipeline.run_labeling(target_enterprise_id)
+                    logger.info("Weekly labeling complete for enterprise filter %s: %s clusters", target_enterprise_id, labeled)
+                except Exception as exc:
+                    logger.exception("Weekly labeling task failed", exc_info=exc)
+
+        background_tasks.add_task(_run_labeling_task, enterprise_id)
+        return LabelingResponse(
+            message="Weekly labeling scheduled. Check logs for completion.",
+            labeled_clusters=0,
+        )
 
     return app
 
