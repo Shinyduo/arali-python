@@ -1,0 +1,1082 @@
+import {
+  pgTable,
+  uuid,
+  text,
+  varchar,
+  integer,
+  json,
+  jsonb,
+  timestamp,
+  boolean,
+  index,
+  uniqueIndex,
+  primaryKey,
+  pgEnum,
+  customType,
+} from "drizzle-orm/pg-core";
+import { unique } from "drizzle-orm/pg-core";
+
+// Helper for timestamptz
+const timestamptz = (name: string) => timestamp(name, { withTimezone: true });
+
+// pgvector custom type
+const vector = (dimensions: number) =>
+  customType<{ data: number[]; driverData: unknown }>({
+    dataType() {
+      return `vector(${dimensions})`;
+    },
+  });
+
+/***********************************
+ * ENUMS (PostgreSQL enum types)
+ ***********************************/
+export const roleScopeTypeEnum = pgEnum("role_scope_type", [
+  "enterprise",
+  "org_unit",
+  "self",
+]);
+
+export const botSessionStateEnum = pgEnum("bot_session_state", [
+  "not_started",
+  "started",
+  "ready",
+  "joining",
+  "joined_not_recording",
+  "joined_recording",
+  "joined_recording_permission_denied",
+  "leaving",
+  "post_processing",
+  "ended",
+  "fatal_error",
+  "waiting_room",
+  "cancelled",
+  "deleted",
+]);
+
+// Status enum for action items
+export const actionItemStatusEnum = pgEnum("action_item_status", [
+  "todo",
+  "in_progress",
+  "blocked",
+  "done",
+  "deleted",
+]);
+
+export const botTranscriptionStateEnum = pgEnum("bot_transcription_state", [
+  "not_started",
+  "started",
+  "starting",
+  "streaming",
+  "completed",
+  "failed",
+]);
+
+export const botRecordingStateEnum = pgEnum("bot_recording_state", [
+  "not_started",
+  "started",
+  "starting",
+  "recording",
+  "completed",
+  "failed",
+]);
+
+export const meetingsStateEnum = pgEnum("meetings_state", [
+  "scheduled",
+  "skip",
+  "in_progress",
+  "completed",
+  "cancelled",
+  "error",
+  "deleted",
+  "no_show",
+  "bot_denied_entry",
+]);
+
+export const meetingChannelEnum = pgEnum("meeting_channel", [
+  "gmeet",
+  "zoom",
+  "teams",
+  "offline",
+]);
+
+export const recurringStateEnum = pgEnum("recurring_meetings_state", [
+  "active",
+  "cancelled",
+]);
+
+export const orgUnitTypeEnum = pgEnum("org_unit_type", [
+  "sales",
+  "cs",
+  "onboarding",
+  "exec",
+]);
+
+// NOTE: Postgres allows a type and a table to share the same name. To avoid TS symbol conflicts, the
+// variable is named calendarWebhookEnum while the underlying PG type is "calendar_webhook".
+// renamed underlying PG type to avoid collision with an existing DB type
+export const calendarWebhookStatusEnum = pgEnum("calendar_webhook_status", [
+  "active",
+  "expired",
+  "error",
+]);
+
+// Add a new enum for the type column
+export const meetingTypeEnum = pgEnum("meeting_type", ["external", "internal"]);
+
+// Metrics enums
+export const metricDataTypeEnum = pgEnum("metric_data_type", [
+  "number",
+  "percent",
+  "boolean",
+  "text",
+  "enum",
+  "json",
+]);
+
+export const metricRollupFnEnum = pgEnum("metric_rollup_fn", [
+  "sum",
+  "avg",
+  "min",
+  "max",
+  "count",
+  "count_distinct",
+  "last_non_null",
+]);
+
+export const metricScopeKindEnum = pgEnum("metric_scope_kind", [
+  "meeting",
+  "participant_in_meeting"
+]);
+
+export const metricAggregationLevelEnum = pgEnum("metric_aggregation_level", [
+  "self",
+  "direct_reports",
+  "hierarchy",
+  "enterprise",
+]);
+
+export const metricGrainEnum = pgEnum("metric_grain", [
+  "meeting",
+  "daily",
+  "user_daily",
+]);
+
+export const insightClusterTypeEnum = pgEnum("insight_cluster_type", [
+  "Adoption",
+  "Integrations",
+  "Analytics",
+  "UI/UX",
+  "Configuration",
+  "Access Control",
+  "Competitor Reference",
+]);
+
+/***********************************
+ * TABLES
+ ***********************************/
+export const appUser = pgTable(
+  "app_user",
+  {
+    id: uuid("id").defaultRandom().primaryKey().notNull(),
+    name: text("name").notNull(),
+    email: text("email").notNull(),
+    phone: varchar("phone").notNull(),
+    passwordHash: text("password_hash"),
+    emailVerifiedAt: timestamptz("email_verified_at"),
+    provider: text("provider"),
+    providerId: varchar("provider_id"),
+    createdAt: timestamptz("created_at").defaultNow().notNull(),
+    updatedAt: timestamptz("updated_at").defaultNow().notNull(),
+  },
+  (table) => ({
+    emailUnique: uniqueIndex("app_user_email_unique").on(table.email),
+    phoneUnique: uniqueIndex("app_user_phone_unique").on(table.phone),
+  })
+);
+
+export const enterprise = pgTable(
+  "enterprise",
+  {
+    id: uuid("id").defaultRandom().primaryKey().notNull(),
+    name: text("name").notNull(),
+    subdomain: text("subdomain").notNull(),
+    isReal: boolean("is_real").notNull().default(false), // New column for identifying real enterprises
+    createdAt: timestamptz("created_at").defaultNow().notNull(),
+    updatedAt: timestamptz("updated_at").defaultNow().notNull(),
+  },
+  (table) => ({
+    subdomainUnique: uniqueIndex("enterprise_subdomain_unique").on(
+      table.subdomain
+    ),
+  })
+);
+
+// Allow explicit any here because this table is self-referential and causes
+// recursive type inference issues with DrawDB/Drizzle; narrow the scope of the
+// rule to this single line.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export const orgUnit: any = pgTable(
+  "org_unit",
+  {
+    id: uuid("id").defaultRandom().primaryKey().notNull(),
+    enterpriseId: uuid("enterprise_id")
+      .notNull()
+      .references(() => enterprise.id, { onDelete: "cascade" }),
+    name: text("name").notNull(),
+    type: orgUnitTypeEnum("type").notNull().default("exec"),
+    parentId: uuid("parent_id").references(() => orgUnit.id, {
+      onDelete: "set null",
+    }),
+    createdAt: timestamptz("created_at").defaultNow().notNull(),
+    updatedAt: timestamptz("updated_at").defaultNow().notNull(),
+  },
+  (table) => ({
+    orgUnitEnterpriseIdx: index("org_unit_enterprise_idx").on(
+      table.enterpriseId
+    ),
+    orgUnitParentIdx: index("org_unit_parent_idx").on(table.parentId),
+  })
+);
+
+export const orgUnitClosure = pgTable(
+  "org_unit_closure",
+  {
+    ancestorId: uuid("ancestor_id")
+      .notNull()
+      .references(() => orgUnit.id, { onDelete: "cascade" }),
+    descendantId: uuid("descendant_id")
+      .notNull()
+      .references(() => orgUnit.id, { onDelete: "cascade" }),
+    level: integer("level").notNull(),
+    createdAt: timestamptz("created_at").defaultNow().notNull(),
+    updatedAt: timestamptz("updated_at").defaultNow().notNull(),
+  },
+  (table) => ({
+    pk: primaryKey({
+      name: "org_unit_closure_pk",
+      columns: [table.ancestorId, table.descendantId],
+    }),
+  })
+);
+
+export const userEnterprise = pgTable(
+  "user_enterprise",
+  {
+    id: uuid("id").defaultRandom().primaryKey().notNull(),
+    enterpriseId: uuid("enterprise_id")
+      .notNull()
+      .references(() => enterprise.id, { onDelete: "cascade" }),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => appUser.id, { onDelete: "cascade" }),
+    // Onboarding state stored as a single JSONB document following shape:
+    // {
+    //   onboarding: { step1: 'done'|'pending', step2: 'done'|'pending', step3: 'done'|'pending'|'skipped', completedOnce: boolean, completedAt?: ISOString },
+    //   v: 1,
+    //   updatedAt: ISOString
+    // }
+    onboardingJson: jsonb("onboarding_json"),
+    createdAt: timestamptz("created_at").defaultNow().notNull(),
+    updatedAt: timestamptz("updated_at").defaultNow().notNull(),
+  },
+  (table) => ({
+    userEnterpriseUserIdx: index("user_enterprise_user_idx").on(table.userId),
+    userEnterpriseEnterpriseIdx: index("user_enterprise_enterprise_idx").on(
+      table.enterpriseId
+    ),
+  })
+);
+
+export const role = pgTable(
+  "role",
+  {
+    id: uuid("id").defaultRandom().primaryKey().notNull(),
+    enterpriseId: uuid("enterprise_id").references(() => enterprise.id, {
+      onDelete: "cascade",
+    }),
+    key: text("key").notNull(),
+    name: text("name").notNull(),
+    priority: integer("priority"),
+    uiConfig: jsonb("ui_config"),
+    createdAt: timestamptz("created_at").defaultNow().notNull(),
+    updatedAt: timestamptz("updated_at").defaultNow().notNull(),
+  },
+  (table) => ({
+    roleEnterpriseIdx: index("role_enterprise_idx").on(table.enterpriseId),
+    roleKeyUnique: uniqueIndex("role_key_unique").on(table.key),
+  })
+);
+
+export const permission = pgTable(
+  "permission",
+  {
+    id: uuid("id").defaultRandom().primaryKey().notNull(),
+    action: text("action").notNull(),
+    resource: text("resource").notNull(),
+    createdAt: timestamptz("created_at").defaultNow().notNull(),
+    updatedAt: timestamptz("updated_at").defaultNow().notNull(),
+  },
+  (table) => ({
+    permissionResourceIdx: index("permission_resource_idx").on(table.resource),
+  })
+);
+
+export const rolePermission = pgTable(
+  "role_permission",
+  {
+    id: uuid("id").defaultRandom().primaryKey().notNull(),
+    roleId: uuid("role_id")
+      .notNull()
+      .references(() => role.id, { onDelete: "cascade" }),
+    permissionId: uuid("permission_id")
+      .notNull()
+      .references(() => permission.id, { onDelete: "cascade" }),
+    createdAt: timestamptz("created_at").defaultNow().notNull(),
+    updatedAt: timestamptz("updated_at").defaultNow().notNull(),
+  },
+  (table) => ({
+    rolePermissionRoleIdx: index("role_permission_role_idx").on(table.roleId),
+    rolePermissionPermissionIdx: index("role_permission_permission_idx").on(
+      table.permissionId
+    ),
+  })
+);
+
+export const userRoleAssignment = pgTable(
+  "user_role_assignment",
+  {
+    id: uuid("id").defaultRandom().primaryKey().notNull(),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => appUser.id, { onDelete: "cascade" }),
+    roleId: uuid("role_id")
+      .notNull()
+      .references(() => role.id, { onDelete: "cascade" }),
+    enterpriseId: uuid("enterprise_id").references(() => enterprise.id, {
+      onDelete: "cascade",
+    }),
+    scopeType: roleScopeTypeEnum("scope_type"),
+    orgUnitId: uuid("org_unit_id").references(() => orgUnit.id, {
+      onDelete: "set null",
+    }),
+    createdAt: timestamptz("created_at").defaultNow().notNull(),
+    updatedAt: timestamptz("updated_at").defaultNow().notNull(),
+  },
+  (table) => ({
+    userRoleAssignmentUserIdx: index("user_role_assignment_user_idx").on(
+      table.userId
+    ),
+    userRoleAssignmentRoleIdx: index("user_role_assignment_role_idx").on(
+      table.roleId
+    ),
+    userRoleAssignmentEnterpriseIdx: index(
+      "user_role_assignment_enterprise_idx"
+    ).on(table.enterpriseId),
+  })
+);
+export const userOrgUnit = pgTable(
+  "user_org_unit",
+  {
+    id: uuid("id").defaultRandom().primaryKey().notNull(),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => appUser.id, { onDelete: "cascade" }),
+    orgUnitId: uuid("org_unit_id")
+      .notNull()
+      .references(() => orgUnit.id, { onDelete: "cascade" }),
+    enterpriseId: uuid("enterprise_id")
+      .notNull()
+      .references(() => enterprise.id, { onDelete: "cascade" }),
+    createdAt: timestamptz("created_at").defaultNow().notNull(),
+    updatedAt: timestamptz("updated_at").defaultNow().notNull(),
+  },
+  (table) => ({
+    userOrgUnitUserIdx: index("user_org_unit_user_idx").on(table.userId),
+    userOrgUnitOrgUnitIdx: index("user_org_unit_org_unit_idx").on(
+      table.orgUnitId
+    ),
+    userOrgUnitEnterpriseIdx: index("user_org_unit_enterprise_idx").on(
+      table.enterpriseId
+    ),
+  })
+);
+export const meetings = pgTable(
+  "meetings",
+  {
+    id: uuid("id").defaultRandom().primaryKey().notNull(),
+    enterpriseId: uuid("enterprise_id")
+      .notNull()
+      .references(() => enterprise.id, { onDelete: "cascade" }),
+    orgUnitId: uuid("org_unit_id")
+      .references(() => orgUnit.id, { onDelete: "set null" }),
+    title: text("title").notNull(),
+    channel: meetingChannelEnum("channel"),
+    joinUrl: text("join_url"),
+    scheduledStartAt: timestamptz("scheduled_start_at").notNull(),
+    scheduledEndAt: timestamptz("scheduled_end_at").notNull(),
+    status: meetingsStateEnum("status").notNull(),
+    hostUserId: uuid("host_user_id"),
+    externalMeetingId: text("external_meeting_id"),
+    metadata: jsonb("metadata"),
+    recurringMeetingId: text("recurring_meeting_id").references(
+      () => recurringMeetings.recurringMeetingId,
+      { onDelete: "set null" }
+    ), // New column
+    type: meetingTypeEnum("type").notNull().default("internal"), // New column
+    thumbnailUrl: text("thumbnail_url"), // Nullable column for thumbnail URL
+    createdAt: timestamptz("created_at").defaultNow().notNull(),
+    updatedAt: timestamptz("updated_at").defaultNow().notNull(),
+  },
+  (table) => ({
+    meetingsEnterpriseIdx: index("meetings_enterprise_idx").on(
+      table.enterpriseId
+    ),
+    meetingsHostUserIdx: index("meetings_host_user_idx").on(table.hostUserId),
+    // Unique across enterprise + join URL + start time + external meeting id
+    meetingsEnterpriseJoinUrlStartExternalUq: unique(
+      "meetings_enterprise_joinurl_start_external_uq"
+    ).on(
+      table.enterpriseId,
+      table.joinUrl,
+      table.scheduledStartAt,
+      table.externalMeetingId
+    ),
+    meetingsExternalMeetingIdUq: unique("meetings_external_meeting_id_uq").on(
+      table.externalMeetingId
+    ),
+  })
+);
+
+export const participants = pgTable(
+  "participants",
+  {
+    id: uuid("id").defaultRandom().primaryKey().notNull(),
+    meetingId: uuid("meeting_id")
+      .notNull()
+      .references(() => meetings.id, { onDelete: "cascade" }),
+    userId: uuid("user_id").references(() => appUser.id, {
+      onDelete: "set null",
+    }),
+    emailId: text("email_id"),
+    contactNumber: text("contact_number"),
+    displayName: text("display_name"),
+    createdAt: timestamptz("created_at").defaultNow().notNull(),
+    updatedAt: timestamptz("updated_at").defaultNow().notNull(),
+  },
+  (table) => ({
+    participantsMeetingIdx: index("participants_meeting_idx").on(
+      table.meetingId
+    ),
+    participantsUserIdx: index("participants_user_idx").on(table.userId),
+    // Unique constraint on meeting_id + email_id to prevent duplicate participants
+    participantsMeetingEmailUq: unique("participants_meeting_email_uq").on(
+      table.meetingId,
+      table.emailId
+    ),
+  })
+);
+
+export const recording = pgTable(
+  "recording",
+  {
+    id: uuid("id").defaultRandom().primaryKey().notNull(),
+    meetingId: uuid("meeting_id").references(() => meetings.id, {
+      onDelete: "cascade",
+    }),
+    storageUrl: text("storage_url"),
+    durationMs: integer("duration_ms"),
+    status: text("status"),
+    createdAt: timestamptz("created_at").defaultNow().notNull(),
+    updatedAt: timestamptz("updated_at").defaultNow().notNull(),
+  },
+  (table) => ({
+    recordingMeetingIdx: index("recording_meeting_idx").on(table.meetingId),
+  })
+);
+
+export const transcript = pgTable(
+  "transcript",
+  {
+    id: uuid("id").defaultRandom().primaryKey().notNull(),
+    meetingId: uuid("meeting_id")
+      .notNull()
+      .references(() => meetings.id, { onDelete: "cascade" }),
+    language: text("language").notNull(),
+    fullText: text("full_text"),
+    createdAt: timestamptz("created_at").defaultNow().notNull(),
+    updatedAt: timestamptz("updated_at").defaultNow().notNull(),
+  },
+  (table) => ({
+    transcriptMeetingIdx: index("transcript_meeting_idx").on(table.meetingId),
+  })
+);
+
+export const transcriptSegments = pgTable(
+  "transcript_segments",
+  {
+    id: uuid("id").defaultRandom().primaryKey().notNull(),
+    transcriptId: uuid("transcript_id")
+      .notNull()
+      .references(() => transcript.id, { onDelete: "cascade" }),
+    startMs: integer("start_ms").notNull(),
+    endMs: integer("end_ms").notNull(),
+    participantId: uuid("participant_id").references(() => participants.id, {
+      onDelete: "set null",
+    }),
+    speakerName: text("speaker_name"),
+    text: text("text"),
+    createdAt: timestamptz("created_at").defaultNow().notNull(),
+    updatedAt: timestamptz("updated_at").defaultNow().notNull(),
+  },
+  (table) => ({
+    // The original schema's index name referenced a non-existent column; indexing transcript_id here.
+    transcriptSegmentsTranscriptIdx: index(
+      "transcript_segments_transcript_idx"
+    ).on(table.transcriptId),
+  })
+);
+
+export const transcriptChunkEmbedding = pgTable(
+  "transcript_chunk_embedding",
+  {
+    id: uuid("id").defaultRandom().primaryKey().notNull(),
+    transcriptId: uuid("transcript_id").references(() => transcript.id, {
+      onDelete: "cascade",
+    }),
+    chunkIndex: integer("chunk_index"),
+    text: text("text"),
+    embedding: vector(1536)("embedding"),
+    createdAt: timestamptz("created_at").defaultNow().notNull(),
+    updatedAt: timestamptz("updated_at").defaultNow().notNull(),
+  },
+  (table) => ({
+    transcriptChunkEmbeddingTranscriptIdx: index(
+      "transcript_chunk_embedding_transcript_idx"
+    ).on(table.transcriptId),
+  })
+);
+
+export const botSession = pgTable(
+  "bot_session",
+  {
+    id: uuid("id").defaultRandom().primaryKey().notNull(),
+    meetingId: uuid("meeting_id")
+      .notNull()
+      .references(() => meetings.id, { onDelete: "cascade" }),
+    vendorBotId: text("vendor_bot_id"),
+    state: botSessionStateEnum("state").notNull().default("not_started"),
+    transcriptionState: botTranscriptionStateEnum("transcription_state")
+      .notNull()
+      .default("not_started"),
+    recordingState: botRecordingStateEnum("recording_state")
+      .notNull()
+      .default("not_started"),
+    error: text("error"),
+    createdAt: timestamptz("created_at").defaultNow().notNull(),
+    updatedAt: timestamptz("updated_at").defaultNow().notNull(),
+  },
+  (table) => ({
+    botSessionMeetingIdx: index("bot_session_meeting_idx").on(table.meetingId),
+    uniqueMeetingId: uniqueIndex("bot_session_meeting_id_unique").on(
+      table.meetingId
+    ),
+  })
+);
+
+export const botWebhook = pgTable(
+  "bot_webhook",
+  {
+    id: uuid("id").defaultRandom().primaryKey().notNull(),
+    rawBody: jsonb("raw_body").notNull(),
+    createdAt: timestamptz("created_at").defaultNow().notNull(),
+    updatedAt: timestamptz("updated_at").defaultNow().notNull(),
+    vendorBotId: text("vendor_bot_id").notNull(),
+  },
+  (table) => ({
+    // Index on vendor_bot_id as per the FK reference in the original schema
+    botWebhookVendorIdx: index("bot_webhook_vendor_bot_id_idx").on(
+      table.vendorBotId
+    ),
+  })
+);
+
+export const tokens = pgTable(
+  "tokens",
+  {
+    id: uuid("id").defaultRandom().primaryKey().notNull(),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => appUser.id, { onDelete: "cascade" }),
+    accessToken: text("access_token").notNull(),
+    refreshToken: text("refresh_token").notNull(),
+    scopes: json("scopes"),
+    expiryDate: timestamptz("expiry_date").notNull(),
+    isExpired: boolean("is_expired").notNull().default(false),
+    createdAt: timestamptz("created_at").defaultNow().notNull(),
+    updatedAt: timestamptz("updated_at").defaultNow().notNull(),
+  },
+  (table) => ({
+    tokensUserIdx: index("tokens_user_idx").on(table.userId),
+  })
+);
+
+export const emailVerificationCodes = pgTable(
+  "email_verification_codes",
+  {
+    id: uuid("id").defaultRandom().primaryKey().notNull(),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => appUser.id, { onDelete: "cascade" }),
+    codeHash: text("code_hash").notNull(),
+    expiresAt: timestamptz("expires_at").notNull(),
+    consumedAt: timestamptz("consumed_at"),
+    createdAt: timestamptz("created_at").defaultNow().notNull(),
+    updatedAt: timestamptz("updated_at").defaultNow().notNull(),
+    enterpriseId: uuid("enterprise_id").references(() => enterprise.id),
+  },
+  (table) => ({
+    emailVerificationCodesUserIdx: index(
+      "email_verification_codes_user_idx"
+    ).on(table.userId),
+  })
+);
+
+export const calendarWebhook = pgTable(
+  "calendar_webhook",
+  {
+    id: uuid("id").defaultRandom().primaryKey().notNull(),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => appUser.id),
+    resourceId: text("resource_id").notNull(),
+    channelId: text("channel_id").notNull(),
+    expirationDate: timestamptz("expiration_date").notNull(),
+    status: calendarWebhookStatusEnum("status").notNull(),
+    calendarId: text("calendar_id").notNull(), // e.g. "primary"
+    token: text("token"), // channel token (optional but recommended)
+    nextSyncToken: text("next_sync_token"), // for incremental syncs
+    resourceUri: text("resource_uri"),
+    logs: json("logs"),
+    createdAt: timestamptz("created_at").defaultNow().notNull(),
+    updatedAt: timestamptz("updated_at").defaultNow().notNull(),
+  },
+  (table) => ({
+    calendarWebhookChannelUnique: uniqueIndex(
+      "calendar_webhook_channel_unique"
+    ).on(table.channelId),
+  })
+);
+
+export const calendarWebhookLogs = pgTable("calendar_webhook_logs", {
+  id: uuid("id").defaultRandom().primaryKey().notNull(),
+  // store the channel id as plain text; avoid FK constraint to calendar_webhook.channel_id which
+  // can cause issues if the unique constraint/order doesn't align during schema push
+  channelId: text("channel_id").notNull(),
+  logs: json("logs"),
+  createdAt: timestamptz("created_at").defaultNow().notNull(),
+  updatedAt: timestamptz("updated_at").defaultNow().notNull(),
+});
+
+export const recurringMeetings = pgTable(
+  "recurring_meetings",
+  {
+    id: uuid("id").defaultRandom().primaryKey().notNull(),
+    name: text("name").notNull(),
+    recurringMeetingId: text("recurring_meeting_id").notNull(),
+    lastSync: timestamptz("last_sync"),
+    status: recurringStateEnum("status").notNull().default("active"),
+    resourceId: text("resource_id").notNull(),
+    createdAt: timestamptz("created_at").defaultNow().notNull(),
+    updatedAt: timestamptz("updated_at").defaultNow().notNull(),
+  },
+  (t) => ({
+    recurringMeetingIdUq: unique(
+      "recurring_meetings_recurring_meeting_id_key"
+    ).on(t.recurringMeetingId),
+  })
+);
+
+export const settings = pgTable(
+  "settings",
+  {
+    id: uuid("id").defaultRandom().primaryKey().notNull(),
+    enterpriseId: uuid("enterprise_id")
+      .notNull()
+      .references(() => enterprise.id, { onDelete: "cascade" }),
+    userId: uuid("user_id").references(() => appUser.id, {
+      onDelete: "cascade",
+    }),
+    type: text("type").notNull(),
+    Value: jsonb("value").notNull(), // Store settings as JSONB
+    createdAt: timestamptz("created_at").defaultNow().notNull(),
+    updatedAt: timestamptz("updated_at").defaultNow().notNull(),
+  },
+  (table) => ({
+    settingsEnterpriseIdx: index("settings_enterprise_idx").on(
+      table.enterpriseId
+    ),
+    settingsUserIdx: index("settings_user_idx").on(table.userId),
+    settingsTypeIdx: index("settings_type_idx").on(table.type),
+  })
+);
+
+/***********************************
+ * METRICS TABLES
+ ***********************************/
+export const metrics = pgTable(
+  "metrics",
+  {
+    id: uuid("id").defaultRandom().primaryKey().notNull(),
+    enterpriseId: uuid("enterprise_id").references(() => enterprise.id, { onDelete: "cascade" }),
+    orgUnitId: uuid("org_unit_id").references(() => orgUnit.id, { onDelete: "cascade" }),
+    key: text("key").notNull(),
+    name: text("name").notNull(),
+    description: text("description"),
+    dataType: metricDataTypeEnum("data_type").notNull(),
+    unit: text("unit"),
+    rollupFn: metricRollupFnEnum("rollup_fn").notNull(),
+    higherIsBetter: boolean("higher_is_better").notNull().default(false),
+    scopeKind: metricScopeKindEnum("scope_kind").notNull(),
+    applicableOrgTypes: jsonb("applicable_org_types").notNull().default("[]"),
+    applicableMeetingTypes: jsonb("applicable_meeting_types").notNull().default("[]"),
+    visibleToRoles: jsonb("visible_to_roles").notNull().default("[]"),
+    aggregationLevel: metricAggregationLevelEnum("aggregation_level").notNull(),
+    buckets: jsonb("buckets"),
+    version: integer("version").notNull().default(1),
+    isAiGenerated: text("is_ai_generated"),
+    createdAt: timestamptz("created_at").defaultNow().notNull(),
+    updatedAt: timestamptz("updated_at").defaultNow().notNull(),
+  },
+  (table) => ({
+    metricsOrgUnitEnterpriseKeyUnique: uniqueIndex("metrics_org_unit_enterprise_key_unique").on(
+      table.orgUnitId,
+      table.enterpriseId,
+      table.key
+    ),
+    metricsApplicableOrgTypesGin: index(
+      "metrics_applicable_org_types_gin"
+    ).using("gin", table.applicableOrgTypes),
+    metricsApplicableMeetingTypesGin: index(
+      "metrics_applicable_meeting_types_gin"
+    ).using("gin", table.applicableMeetingTypes),
+    metricsVisibleToRolesGin: index("metrics_visible_to_roles_gin").using(
+      "gin",
+      table.visibleToRoles
+    ),
+  })
+);
+
+export const metricsData = pgTable(
+  "metrics_data",
+  {
+    id: uuid("id").defaultRandom().primaryKey().notNull(),
+    metricId: uuid("metric_id")
+      .notNull()
+      .references(() => metrics.id, { onDelete: "cascade" }),
+    enterpriseId: uuid("enterprise_id")
+      .notNull()
+      .references(() => enterprise.id, { onDelete: "cascade" }),
+    orgUnitId: uuid("org_unit_id")
+      .references(() => orgUnit.id, { onDelete: "set null" }),
+    meetingId: uuid("meeting_id").references(() => meetings.id, {
+      onDelete: "cascade",
+    }),
+    userId: uuid("user_id").references(() => appUser.id, {
+      onDelete: "set null",
+    }),
+    grain: metricGrainEnum("grain").notNull(),
+    date: timestamp("date", { mode: "date" }),
+    valueNumber: text("value_number"), // Using text to support PostgreSQL numeric type
+    valueText: text("value_text"),
+    valueJson: jsonb("value_json"),
+    computedAt: timestamptz("computed_at").defaultNow().notNull(),
+    sourceHostUserId: uuid("source_host_user_id").references(() => appUser.id, {
+      onDelete: "set null",
+    }),
+    sourceOrgUnitId: uuid("source_org_unit_id").references(() => orgUnit.id, {
+      onDelete: "set null",
+    }),
+  },
+  (table) => ({
+    metricsDataEntOuDateGrainIdx: index(
+      "metrics_data_ent_ou_date_grain_idx"
+    ).on(table.enterpriseId, table.orgUnitId, table.date, table.grain),
+    metricsDataMetricMeetingIdx: index("metrics_data_metric_meeting_idx").on(
+      table.metricId,
+      table.meetingId
+    ),
+    metricsDataMetricUserDateIdx: index("metrics_data_metric_user_date_idx").on(
+      table.metricId,
+      table.userId,
+      table.date
+    ),
+    metricsDataMetricOuDateIdx: index("metrics_data_metric_ou_date_idx").on(
+      table.metricId,
+      table.orgUnitId,
+      table.date
+    ),
+  })
+);
+
+export const chatMessages = pgTable(
+  "chat_messages",
+  {
+    // 1) id
+    id: text("id").primaryKey().notNull(), // provider msg id
+
+    // 2) meeting_id → meetings(id)
+    meetingId: uuid("meeting_id")
+      .notNull()
+      .references(() => meetings.id, { onDelete: "cascade" }),
+
+    // 3) participant_id → participants(id) (nullable if sender can't be resolved)
+    participantId: uuid("participant_id").references(() => participants.id, {
+      onDelete: "set null",
+    }),
+
+    // 4) recipient (default 'everyone')
+    recipient: text("recipient").notNull().default("everyone"),
+
+    // 5) text
+    text: text("text").notNull(),
+
+    // 6) timestamp - date time (timestamptz)
+    timestamp: timestamptz("timestamp").notNull(),
+
+    // 7) metadata (jsonb)
+    metadata: jsonb("metadata").notNull().default({}),
+
+    // 8) created_at / updated_at
+    createdAt: timestamptz("created_at").defaultNow().notNull(),
+    updatedAt: timestamptz("updated_at").defaultNow().notNull(),
+  },
+  (t) => ({
+    // Fast filters by meeting + time
+    chatByMeetingTsIdx: index("chat_messages_meeting_ts_idx").on(
+      t.meetingId,
+      t.timestamp
+    ),
+    // Handy when you want all msgs from a participant
+    chatByParticipantIdx: index("chat_messages_participant_idx").on(
+      t.participantId
+    ),
+  })
+);
+
+// --- Participant sessions (per-join window) ---------------------------------
+export const participantSessions = pgTable(
+  "participant_sessions",
+  {
+    // 1) id
+    id: uuid("id").defaultRandom().primaryKey().notNull(),
+
+    // 2) meeting_id → meetings(id)
+    meetingId: uuid("meeting_id")
+      .notNull()
+      .references(() => meetings.id, { onDelete: "cascade" }),
+
+    // 3) participant_id → participants(id)
+    participantId: uuid("participant_id")
+      .notNull()
+      .references(() => participants.id, { onDelete: "cascade" }),
+
+    // 4) join_time
+    joinTime: timestamptz("join_time").notNull(),
+
+    // 5) end_time
+    endTime: timestamptz("end_time"),
+
+    // (Standard stamps for consistency with your codebase)
+    createdAt: timestamptz("created_at").defaultNow().notNull(),
+    updatedAt: timestamptz("updated_at").defaultNow().notNull(),
+  },
+  (t) => ({
+    // Common lookups
+    psByMeetingIdx: index("participant_sessions_meeting_idx").on(t.meetingId),
+    psByParticipantIdx: index("participant_sessions_participant_idx").on(
+      t.participantId
+    ),
+    // De-dupe guard if you want at-most-one open window at a given join_time
+    psMeetingParticipantJoinUq: uniqueIndex(
+      "participant_sessions_meeting_participant_join_uq"
+    ).on(t.meetingId, t.participantId, t.joinTime),
+  })
+);
+
+
+
+export const meetingActionItem = pgTable("meeting_action_item", {
+  id: uuid("id").defaultRandom().primaryKey().notNull(),
+  meetingId: uuid("meeting_id")
+    .notNull()
+    .references(() => meetings.id, { onDelete: "cascade" }),
+  enterpriseId: uuid("enterprise_id")
+    .notNull()
+    .references(() => enterprise.id, { onDelete: "cascade" }),
+  orgUnitId: uuid("org_unit_id")
+    .notNull()
+    .references(() => orgUnit.id, { onDelete: "cascade" }),
+  participantId: uuid("participant_id").references(() => participants.id, { onDelete: "set null" }),
+  ownerUserId: uuid("owner_user_id").references(() => appUser.id, {
+    onDelete: "set null",
+  }),
+  title: text("title").notNull(),
+  description: text("description"),
+  dueAt: timestamp("due_at", { withTimezone: true }),
+  timestamp: text("timestamp"), // HH:MM:SS format from transcript
+  status: actionItemStatusEnum("status").notNull().default("todo"),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+});
+
+export const orgUnitDailyMetrics = pgTable(
+  "org_unit_daily_metrics",
+  {
+    id: uuid("id").defaultRandom().primaryKey().notNull(),
+
+    enterpriseId: uuid("enterprise_id")
+      .notNull()
+      .references(() => enterprise.id, { onDelete: "cascade" }),
+
+    orgUnitId: uuid("org_unit_id")
+      .notNull()
+      .references(() => orgUnit.id, { onDelete: "cascade" }),
+
+    // window end anchor (e.g. '2025-10-26')
+    windowEndDate: timestamp("window_end_date", { mode: "date" }).notNull(),
+
+    // window length in days (1, 7, 30...)
+    windowDays: integer("window_days").notNull().default(1),
+
+    // metric catalog FK
+    metricId: uuid("metric_id")
+      .notNull()
+      .references(() => metrics.id, { onDelete: "cascade" }),
+
+    // aggregated values
+    valueNumber: text("value_number"),
+    valueJson: jsonb("value_json"),
+
+    // bookkeeping
+    computedAt: timestamp("computed_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (t) => ({
+    // upsert guard: unique per (org, metric, windowEndDate, windowDays)
+    ouDailyUnique: uniqueIndex("ou_daily_unique").on(
+      t.enterpriseId,
+      t.orgUnitId,
+      t.metricId,
+      t.windowEndDate,
+      t.windowDays
+    ),
+
+    // dashboard lookup: this matches the WHERE clause shape in your API
+    ouDailyLookupIdx: index("ou_daily_lookup_idx").on(
+      t.enterpriseId,
+      t.orgUnitId,
+      t.windowEndDate,
+      t.windowDays
+    ),
+  })
+);
+
+export const orgUnitMeetingMapping = pgTable(
+  "org_unit_meeting_mapping",
+  {
+    id: uuid("id").defaultRandom().primaryKey().notNull(),
+    orgUnitId: uuid("org_unit_id")
+      .notNull()
+      .references(() => orgUnit.id, { onDelete: "cascade" }),
+    meetingId: uuid("meeting_id")
+      .notNull()
+      .references(() => meetings.id, { onDelete: "cascade" }),
+    enterpriseId: uuid("enterprise_id")
+      .notNull()
+      .references(() => enterprise.id, { onDelete: "cascade" }),
+    createdAt: timestamptz("created_at").defaultNow().notNull(),
+    updatedAt: timestamptz("updated_at").defaultNow().notNull(),
+  },
+  (table) => ({
+    orgUnitMeetingMappingOrgUnitIdx: index(
+      "org_unit_meeting_mapping_org_unit_idx"
+    ).on(table.orgUnitId),
+    orgUnitMeetingMappingMeetingIdx: index(
+      "org_unit_meeting_mapping_meeting_idx"
+    ).on(table.meetingId),
+    orgUnitMeetingMappingUq: uniqueIndex(
+      "org_unit_meeting_mapping_uq"
+    ).on(table.orgUnitId, table.meetingId),
+  })
+);
+
+export const meetingInsights = pgTable(
+  "meeting_insights",
+  {
+    id: uuid("id").defaultRandom().primaryKey().notNull(),
+    enterpriseId: uuid("enterprise_id")
+      .notNull()
+      .references(() => enterprise.id, { onDelete: "cascade" }),
+
+    meetingId: uuid("meeting_id")
+      .notNull()
+      .references(() => meetings.id, { onDelete: "cascade" }),
+
+    participantId: uuid("participant_id")
+      .references(() => participants.id, { onDelete: "set null" }),
+
+    productId: text("product_id"),
+
+    metricKey: text("metric_key").notNull(),
+
+    detailsJson: jsonb("details_json"),
+    // type-specific metadata (reason, product, severity, evidence, etc.)
+
+    // --- Transcript anchor (optional) ---
+    transcriptTs: text("transcript_ts"),
+    // Store as PostgreSQL INTERVAL for HH:MM:SS accuracy & filtering.
+
+    // --- Embeddings & Clustering ---
+    embedding: vector(1024)("embedding"),
+    // BGE-large (normalized), optional unless type='feature'
+
+    clusterId: text("cluster_id").references(() => insightClusters.id, { onDelete: "set null" }),
+    // assigned by offline/online clusterer; null until processed
+
+    // --- Timestamp ---
+    createdAt: timestamptz("created_at").defaultNow().notNull(),
+  });
+
+
+export const insightClusters = pgTable("insight_clusters", {
+  id: text("id").primaryKey(),
+
+  enterpriseId: uuid("enterprise_id")
+    .notNull()
+    .references(() => enterprise.id, { onDelete: "cascade" }),
+
+  metricKey: text("metric_key").notNull(),
+
+  // Keep productId as TEXT for now (no FK).
+  // Later, when you add product KB, just migrate this column to uuid + FK.
+  productId: text("product_id"),
+
+  // Human-friendly metadata (LLM assigned)
+  name: text("name"),
+  description: text("description"),
+  type: insightClusterTypeEnum("type"),
+
+  // Clustering metadata
+  centroid: vector(1024)("centroid").notNull(),   // normalized centroid
+  size: integer("size").notNull().default(0),     // number of insights mapped here
+
+  createdAt: timestamptz("created_at").defaultNow().notNull(),
+  updatedAt: timestamptz("updated_at").defaultNow().notNull(),
+});
