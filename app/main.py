@@ -200,7 +200,7 @@ class ClusterLabeler:
                     {
                         "text": (
                             "You are a product manager working at a B2B company. "
-                            "Summarize the dominant theme, craft a differentiated 3-8 word name "
+                            "Summarize the dominant theme, craft a differentiated 8-10 word name."
                             "with crisp product-style wording (avoid generic titles like 'Feature Updates'), "
                             "concise description, and assign a valid type."
                             "Title should be descriptive, specific, and easy to scan, anyone reading should get the meaning in a single glance."
