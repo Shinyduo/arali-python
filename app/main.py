@@ -200,9 +200,10 @@ class ClusterLabeler:
                     {
                         "text": (
                             "You are a product manager working at a B2B company. "
-                            "Summarize the dominant theme, craft a 3-8 word name, "
+                            "Summarize the dominant theme, craft a differentiated 3-8 word name "
+                            "with crisp product-style wording (avoid generic titles like 'Feature Updates'), "
                             "concise description, and assign a valid type."
-                            "Title should be small but descriptive enough."
+                            "Title should be descriptive, specific, and easy to scan, anyone reading should get the meaning in a single glance."
                             "Description should be concise and cover the main theme and should be around 30-50 words."
                         )
                     }
@@ -378,10 +379,10 @@ class FeatureReceptionPipeline:
         logger.info(f"Assigned {assigned} insights to clusters, updated {clusters_updated} clusters.")
         return {"embedded": embedded, "assigned": assigned, "clusters_updated": clusters_updated}
 
-    async def run_recluster(self) -> list[dict]:
+    async def run_recluster(self, target_enterprise_id: UUID | None = None) -> list[dict]:
         logger.info("Starting weekly re-clustering process.")
         results: list[dict] = []
-        pairs = await self._list_pairs()
+        pairs = await self._list_pairs(target_enterprise_id)
         for enterprise_id, product_id in pairs:
             logger.info(f"Re-clustering for enterprise {enterprise_id}, product {product_id}")
             embeddings = await self._fetch_embeddings_for_pair(enterprise_id, product_id)
@@ -415,10 +416,10 @@ class FeatureReceptionPipeline:
             )
         return results
 
-    async def run_merge(self) -> list[dict]:
+    async def run_merge(self, target_enterprise_id: UUID | None = None) -> list[dict]:
         logger.info("Starting weekly cluster merge process.")
         results: list[dict] = []
-        pairs = await self._list_cluster_pairs()
+        pairs = await self._list_cluster_pairs(target_enterprise_id)
         for enterprise_id, product_id in pairs:
             logger.info(f"Checking merges for enterprise {enterprise_id}, product {product_id}")
             clusters = await self._fetch_clusters(enterprise_id, product_id)
@@ -457,10 +458,10 @@ class FeatureReceptionPipeline:
                 )
         return results
 
-    async def run_labeling(self) -> int:
+    async def run_labeling(self, target_enterprise_id: UUID | None = None) -> int:
         logger.info("Starting weekly cluster labeling process.")
         total = 0
-        pairs = await self._list_cluster_pairs()
+        pairs = await self._list_cluster_pairs(target_enterprise_id)
         for enterprise_id, product_id in pairs:
             clusters = await self._fetch_clusters(enterprise_id, product_id)
             for cluster in clusters:
@@ -659,16 +660,18 @@ class FeatureReceptionPipeline:
             size,
         )
 
-    async def _list_pairs(self) -> list[tuple[UUID, str | None]]:
-        rows = await self.conn.fetch(
-            """
+    async def _list_pairs(self, enterprise_id: UUID | None = None) -> list[tuple[UUID, str | None]]:
+        query = """
             SELECT DISTINCT enterprise_id, product_id
             FROM meeting_insights
             WHERE metric_key = $1
               AND embedding IS NOT NULL
-            """,
-            METRIC_KEY,
-        )
+        """
+        params: list[Any] = [METRIC_KEY]
+        if enterprise_id is not None:
+            query += " AND enterprise_id = $2"
+            params.append(enterprise_id)
+        rows = await self.conn.fetch(query, *params)
         return [(row["enterprise_id"], row["product_id"]) for row in rows]
 
     async def _fetch_embeddings_for_pair(
@@ -732,15 +735,17 @@ class FeatureReceptionPipeline:
                 assignments,
             )
 
-    async def _list_cluster_pairs(self) -> list[tuple[UUID, str | None]]:
-        rows = await self.conn.fetch(
-            """
+    async def _list_cluster_pairs(self, enterprise_id: UUID | None = None) -> list[tuple[UUID, str | None]]:
+        query = """
             SELECT DISTINCT enterprise_id, product_id
             FROM insight_clusters
             WHERE metric_key = $1
-            """,
-            METRIC_KEY,
-        )
+        """
+        params: list[Any] = [METRIC_KEY]
+        if enterprise_id is not None:
+            query += " AND enterprise_id = $2"
+            params.append(enterprise_id)
+        rows = await self.conn.fetch(query, *params)
         return [(row["enterprise_id"], row["product_id"]) for row in rows]
 
     def _choose_winner(self, a: InsightCluster, b: InsightCluster) -> tuple[InsightCluster, InsightCluster]:
@@ -810,6 +815,10 @@ class DailyTaskResponse(BaseModel):
     clusters_updated: int
 
 
+class WeeklyTaskRequest(BaseModel):
+    enterprise_id: UUID | None = None
+
+
 class MergeResponse(BaseModel):
     enterprise_id: UUID
     product_id: str | None
@@ -855,23 +864,29 @@ def create_app() -> FastAPI:
 
     @app.post("/feature-reception/weekly/recluster", response_model=list[ReclusterResponse])
     async def trigger_recluster(
+        payload: WeeklyTaskRequest | None = None,
         pipeline: FeatureReceptionPipeline = Depends(get_pipeline),
     ) -> list[ReclusterResponse]:
-        results = await pipeline.run_recluster()
+        enterprise_id = payload.enterprise_id if payload else None
+        results = await pipeline.run_recluster(enterprise_id)
         return [ReclusterResponse(**item) for item in results]
 
     @app.post("/feature-reception/weekly/merge", response_model=list[MergeResponse])
     async def trigger_merge(
+        payload: WeeklyTaskRequest | None = None,
         pipeline: FeatureReceptionPipeline = Depends(get_pipeline),
     ) -> list[MergeResponse]:
-        results = await pipeline.run_merge()
+        enterprise_id = payload.enterprise_id if payload else None
+        results = await pipeline.run_merge(enterprise_id)
         return [MergeResponse(**item) for item in results]
 
     @app.post("/feature-reception/weekly/label", response_model=LabelingResponse)
     async def trigger_labeling(
+        payload: WeeklyTaskRequest | None = None,
         pipeline: FeatureReceptionPipeline = Depends(get_pipeline),
     ) -> LabelingResponse:
-        count = await pipeline.run_labeling()
+        enterprise_id = payload.enterprise_id if payload else None
+        count = await pipeline.run_labeling(enterprise_id)
         return LabelingResponse(labeled_clusters=count)
 
     return app
