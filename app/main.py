@@ -423,33 +423,41 @@ class FeatureReceptionPipeline:
         pairs = await self._list_cluster_pairs(target_enterprise_id)
         for enterprise_id, product_id in pairs:
             logger.info(f"Checking merges for enterprise {enterprise_id}, product {product_id}")
-            clusters = await self._fetch_clusters(enterprise_id, product_id)
             merges: list[tuple[str, str]] = []
-            removed: set[str] = set()
-            for idx, cluster in enumerate(clusters):
-                if cluster.id in removed:
-                    continue
-                for other in clusters[idx + 1 :]:
-                    if other.id in removed:
-                        continue
-                    sim = cosine_similarity(cluster.centroid, other.centroid)
-                    if sim < settings.merge_similarity_threshold:
-                        continue
-                    winner, loser = self._choose_winner(cluster, other)
-                    new_centroid, new_size = self._merge_centroids(winner, loser)
-                    await self.conn.execute(
-                        "UPDATE meeting_insights SET cluster_id = $1 WHERE cluster_id = $2",
-                        winner.id,
-                        loser.id,
-                    )
-                    await self.conn.execute("DELETE FROM insight_clusters WHERE id = $1", loser.id)
-                    await self._update_cluster_vector(winner.id, new_centroid, new_size)
-                    winner.centroid = new_centroid
-                    winner.size = new_size
-                    removed.add(loser.id)
-                    merges.append((winner.id, loser.id))
+            merge_iteration = 0
+            
+            # Keep merging until no more merges are found
+            while True:
+                merge_iteration += 1
+                clusters = await self._fetch_clusters(enterprise_id, product_id)
+                found_merge = False
+                
+                for idx, cluster in enumerate(clusters):
+                    if found_merge:
+                        break
+                    for other in clusters[idx + 1 :]:
+                        sim = cosine_similarity(cluster.centroid, other.centroid)
+                        if sim < settings.merge_similarity_threshold:
+                            continue
+                        winner, loser = self._choose_winner(cluster, other)
+                        new_centroid, new_size = self._merge_centroids(winner, loser)
+                        await self.conn.execute(
+                            "UPDATE meeting_insights SET cluster_id = $1 WHERE cluster_id = $2",
+                            winner.id,
+                            loser.id,
+                        )
+                        await self.conn.execute("DELETE FROM insight_clusters WHERE id = $1", loser.id)
+                        await self._update_cluster_vector(winner.id, new_centroid, new_size)
+                        merges.append((winner.id, loser.id))
+                        logger.info(f"Merged cluster {loser.id} into {winner.id} (similarity: {sim:.3f})")
+                        found_merge = True
+                        break
+                
+                if not found_merge:
+                    break
+                    
             if merges:
-                logger.info(f"Performed {len(merges)} merges for {enterprise_id}/{product_id}")
+                logger.info(f"Performed {len(merges)} merges for {enterprise_id}/{product_id} over {merge_iteration} iterations")
                 results.append(
                     {
                         "enterprise_id": enterprise_id,
@@ -567,6 +575,7 @@ class FeatureReceptionPipeline:
 
     async def _backfill_embeddings(self, batch_size: int) -> int:
         total = 0
+        batch_num = 0
         while True:
             query = """
                 SELECT id, details_json
@@ -579,6 +588,8 @@ class FeatureReceptionPipeline:
             rows = await self.conn.fetch(query, METRIC_KEY, batch_size)
             if not rows:
                 break
+            batch_num += 1
+            logger.info(f"Backfilling embeddings: batch {batch_num}, processing {len(rows)} insights")
             texts = [build_feature_text(row["details_json"]) for row in rows]
             vectors = await embedding_client.embed(texts)
             for row, vector in zip(rows, vectors, strict=True):
@@ -588,6 +599,7 @@ class FeatureReceptionPipeline:
                     _vector_to_db(vector),
                 )
                 total += 1
+        logger.info(f"Backfilling complete: processed {total} insights in {batch_num} batches")
         return total
 
     async def _assign_clusters(self, batch_size: int) -> tuple[int, int]:
@@ -595,6 +607,7 @@ class FeatureReceptionPipeline:
         updated_clusters = 0
         cluster_cache: dict[tuple[UUID, str | None], list[InsightCluster]] = {}
         cluster_lookup: dict[str, InsightCluster] = {}
+        batch_num = 0
 
         while True:
             query = """
@@ -609,6 +622,8 @@ class FeatureReceptionPipeline:
             rows = await self.conn.fetch(query, METRIC_KEY, batch_size)
             if not rows:
                 break
+            batch_num += 1
+            logger.info(f"Assigning clusters: batch {batch_num}, processing {len(rows)} insights")
             assignments: list[tuple[UUID, str]] = []
             vectors_by_cluster: dict[str, list[list[float]]] = {}
             for row in rows:
@@ -644,7 +659,13 @@ class FeatureReceptionPipeline:
                     cluster.centroid = new_centroid
                     cluster.size = new_size
                     updated_clusters += 1
+            else:
+                # No assignments made in this batch - stop processing to avoid infinite loop
+                # (insights remain unclustered because no suitable clusters exist or similarity is too low)
+                logger.info(f"No assignments made in batch {batch_num}, stopping cluster assignment")
+                break
 
+        logger.info(f"Cluster assignment complete: assigned {assigned_total} insights, updated {updated_clusters} clusters in {batch_num} batches")
         return assigned_total, updated_clusters
 
     async def _update_cluster_vector(self, cluster_id: str, centroid: Sequence[float], size: int) -> None:
@@ -869,9 +890,12 @@ def create_app() -> FastAPI:
             async with pool.acquire() as connection:
                 pipeline = FeatureReceptionPipeline(connection)
                 try:
-                    await pipeline.run_daily(batch_size)
+                    logger.info(f"Starting daily task with batch_size={batch_size}")
+                    result = await pipeline.run_daily(batch_size)
+                    logger.info(f"Daily task completed successfully: {result}")
                 except Exception as exc:
                     logger.exception("Daily task failed", exc_info=exc)
+                    raise
 
         background_tasks.add_task(_run_daily_task, payload.batch_size)
         return DailyTaskResponse(
@@ -913,10 +937,12 @@ def create_app() -> FastAPI:
             async with pool.acquire() as connection:
                 pipeline = FeatureReceptionPipeline(connection)
                 try:
+                    logger.info(f"Starting weekly labeling task for enterprise_id={target_enterprise_id}")
                     labeled = await pipeline.run_labeling(target_enterprise_id)
-                    logger.info("Weekly labeling complete for enterprise filter %s: %s clusters", target_enterprise_id, labeled)
+                    logger.info(f"Weekly labeling complete for enterprise filter {target_enterprise_id}: {labeled} clusters labeled")
                 except Exception as exc:
                     logger.exception("Weekly labeling task failed", exc_info=exc)
+                    raise
 
         background_tasks.add_task(_run_labeling_task, enterprise_id)
         return LabelingResponse(
