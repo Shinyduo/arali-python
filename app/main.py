@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import json
+import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Sequence
@@ -37,6 +38,9 @@ class Settings(BaseSettings):
 
     database_url: str | None = None
 
+    # Embedding model settings
+    # Model is downloaded once to ~/.cache/torch/sentence_transformers/ and reused
+    # Set to empty string "" to disable model and use deterministic fallback
     embed_model_name: str = "BAAI/bge-large-en-v1.5"
     embedding_dimension: int = 1024
 
@@ -130,20 +134,112 @@ class EmbeddingClient:
         self.dimension = settings.embedding_dimension
         self.model_name = settings.embed_model_name
         self.model = None
-        if self.model_name:
-            try:
-                logger.info(f"Loading embedding model: {self.model_name}")
-                self.model = SentenceTransformer(self.model_name)
-                logger.info("Embedding model loaded successfully.")
-            except Exception as e:
-                logger.error(f"Failed to load local model {self.model_name}: {e}")
+        self._keep_loaded = False  # Flag to keep model loaded across multiple calls
+        self._lock = asyncio.Lock()  # Protect model loading/unloading
+        self._active_users = 0  # Track concurrent users
+
+    async def _load_model(self) -> None:
+        """Load the model into memory (thread-safe)."""
+        async with self._lock:
+            if self.model is not None:
+                return  # Already loaded
+            if self.model_name:
+                try:
+                    logger.info(f"Loading embedding model: {self.model_name}")
+                    self.model = SentenceTransformer(self.model_name)
+                    logger.info("Embedding model loaded successfully.")
+                except Exception as e:
+                    logger.error(f"Failed to load local model {self.model_name}: {e}")
+                    raise
+
+    async def _unload_model(self) -> None:
+        """Unload model from memory to free RAM (thread-safe)."""
+        async with self._lock:
+            # Only unload if no one is using it
+            if self._active_users > 0:
+                logger.debug(f"Not unloading model: {self._active_users} active users")
+                return
+            if self.model is not None:
+                logger.info("Unloading embedding model to free memory")
+                del self.model
+                self.model = None
+                # Force garbage collection to immediately release memory
+                import gc
+                gc.collect()
+                logger.info("Embedding model unloaded")
+
+    def keep_loaded(self):
+        """Context manager to keep model loaded across multiple embed calls."""
+        class KeepLoadedContext:
+            def __init__(self, client: EmbeddingClient):
+                self.client = client
+                
+            def __enter__(self):
+                # Note: This is a synchronous context manager used by synchronous code
+                # The _keep_loaded flag is read atomically in embed() under lock
+                self.client._keep_loaded = True
+                return self.client
+                
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                self.client._keep_loaded = False
+                # Schedule unload asynchronously
+                # By the time this runs, all embed() calls will have captured the old flag value
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        # Create a task to unload after a small delay to let pending operations complete
+                        async def delayed_unload():
+                            await asyncio.sleep(0.1)  # Let pending operations finish
+                            await self.client._unload_model()
+                        asyncio.create_task(delayed_unload())
+                    else:
+                        loop.run_until_complete(self.client._unload_model())
+                except Exception as e:
+                    logger.error(f"Error unloading model: {e}")
+                
+        return KeepLoadedContext(self)
 
     async def embed(self, texts: Sequence[str]) -> list[list[float]]:
-        if self.model:
-            # SentenceTransformer encode returns numpy array or list of numpy arrays
-            vectors = self.model.encode(list(texts), normalize_embeddings=True)
-            return [vec.tolist() for vec in vectors]
+        """
+        Embed texts. By default, loads model, processes, then unloads to free memory.
+        Use keep_loaded() context manager to keep model loaded across multiple calls.
+        Thread-safe: supports concurrent requests.
+        """
+        if self.model_name:
+            # Load model and increment active users atomically
+            await self._load_model()
+            
+            async with self._lock:
+                self._active_users += 1
+                keep_loaded_snapshot = self._keep_loaded  # Capture flag under lock
+            
+            try:
+                # Process embeddings (no lock needed - model.encode is thread-safe)
+                logger.debug(f"Generating embeddings for {len(texts)} texts")
+                vectors = self.model.encode(list(texts), normalize_embeddings=True)
+                result = [vec.tolist() for vec in vectors]
+                
+                # Decrement active users after using the model
+                async with self._lock:
+                    self._active_users -= 1
+                
+                # Unload only if not in keep_loaded context and no active users
+                if not keep_loaded_snapshot:
+                    await self._unload_model()
+                
+                return result
+            except Exception as e:
+                logger.error(f"Error during embedding: {e}")
+                # Ensure we decrement counter even on error
+                async with self._lock:
+                    self._active_users = max(0, self._active_users - 1)
+                # Try to unload if not in keep_loaded context
+                if not keep_loaded_snapshot:
+                    await self._unload_model()
+                raise
         
+        # Fallback to deterministic vectors if no model configured
+        logger.debug(f"Using deterministic embeddings for {len(texts)} texts")
         return [self._deterministic_vector(text) for text in texts]
 
     def _deterministic_vector(self, text: str) -> list[float]:
@@ -373,10 +469,14 @@ class FeatureReceptionPipeline:
 
     async def run_daily(self, batch_size: int) -> dict:
         logger.info(f"Starting daily batch processing with batch_size={batch_size}")
-        embedded = await self._backfill_embeddings(batch_size)
-        logger.info(f"Backfilled embeddings for {embedded} insights.")
-        assigned, clusters_updated = await self._assign_clusters(batch_size)
-        logger.info(f"Assigned {assigned} insights to clusters, updated {clusters_updated} clusters.")
+        
+        # Keep model loaded for entire daily job to avoid repeated load/unload
+        with embedding_client.keep_loaded():
+            embedded = await self._backfill_embeddings(batch_size)
+            logger.info(f"Backfilled embeddings for {embedded} insights.")
+            assigned, clusters_updated = await self._assign_clusters(batch_size)
+            logger.info(f"Assigned {assigned} insights to clusters, updated {clusters_updated} clusters.")
+        
         logger.info("Daily batch processing complete.")
         return {"embedded": embedded, "assigned": assigned, "clusters_updated": clusters_updated}
 
@@ -599,6 +699,8 @@ class FeatureReceptionPipeline:
                     _vector_to_db(vector),
                 )
                 total += 1
+            # Clear references to help garbage collection
+            del texts, vectors
         logger.info(f"Backfilling complete: processed {total} insights in {batch_num} batches")
         return total
 
